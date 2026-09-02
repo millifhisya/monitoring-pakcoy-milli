@@ -1,36 +1,65 @@
 
-# ======================================================================
-# 🌱 MONITORING PAKCOY MILLI
-# ======================================================================
-# FINAL HOSTING VERSION
-#
-# 1. Dashboard Autoplay
-# 2. LSTM Prediction
-# 3. CNN Classification
-# 4. Analytics / History
-#
-# NO TRAINING
-# ======================================================================
-
 import os
-import tempfile
-
+import time
+import pickle
+import json
 import numpy as np
 import pandas as pd
-import gradio as gr
+import streamlit as st
 import matplotlib.pyplot as plt
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-
 from PIL import Image
 
-import joblib
 import tensorflow as tf
+from tensorflow.keras.models import load_model
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_AVAILABLE = True
+except Exception:
+    AUTOREFRESH_AVAILABLE = False
 
 
-# ======================================================================
-# CONFIGURATION
-# ======================================================================
+# ============================================================================
+# PAGE CONFIG
+# ============================================================================
+
+st.set_page_config(
+    page_title="Monitoring Pakcoy MILLI",
+    page_icon="🌱",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+
+# ============================================================================
+# CUSTOM CNN LAYERS
+# ============================================================================
+
+@tf.keras.utils.register_keras_serializable(package="Pakcoy")
+class ChannelAveragePool(tf.keras.layers.Layer):
+
+    def call(self, inputs):
+        return tf.reduce_mean(
+            inputs,
+            axis=-1,
+            keepdims=True
+        )
+
+
+@tf.keras.utils.register_keras_serializable(package="Pakcoy")
+class ChannelMaxPool(tf.keras.layers.Layer):
+
+    def call(self, inputs):
+        return tf.reduce_max(
+            inputs,
+            axis=-1,
+            keepdims=True
+        )
+
+
+# ============================================================================
+# PATH
+# ============================================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -54,7 +83,305 @@ CNN_MODEL_PATH = os.path.join(
     "CNN_Modified_Spatial_Attention_Pakcoy_FINAL.keras"
 )
 
-IMG_SIZE = (224, 224)
+
+# ============================================================================
+# LOAD DATASET
+# ============================================================================
+
+@st.cache_data
+def load_dataset():
+
+    df = pd.read_excel(DATASET_PATH)
+
+    # Time ordering
+    time_order = {
+        "08:00": 1,
+        "12:00": 2,
+        "16:00": 3
+    }
+
+    df["_Time_Order"] = (
+        df["Time"]
+        .astype(str)
+        .str[:5]
+        .map(time_order)
+    )
+
+    df = df.sort_values(
+        ["Day", "DAP", "_Time_Order"]
+    ).reset_index(drop=True)
+
+    df["Replay_Index"] = np.arange(len(df))
+
+    # Timestamp
+    if "Timestamp" not in df.columns:
+
+        base_date = pd.Timestamp("2026-09-01")
+
+        df["Timestamp"] = [
+            base_date
+            + pd.Timedelta(days=int(day) - 1)
+            + pd.Timedelta(
+                hours=int(str(t)[:2])
+            )
+            for day, t in zip(
+                df["Day"],
+                df["Time"]
+            )
+        ]
+
+    return df
+
+
+df = load_dataset()
+
+
+# ============================================================================
+# LOAD LSTM
+# ============================================================================
+
+@st.cache_resource
+def load_lstm():
+
+    model = load_model(
+        LSTM_MODEL_PATH,
+        compile=False
+    )
+
+    with open(
+        LSTM_SCALER_PATH,
+        "rb"
+    ) as f:
+
+        scaler = pickle.load(f)
+
+    return model, scaler
+
+
+# ============================================================================
+# LOAD CNN
+# ============================================================================
+
+@st.cache_resource
+def load_cnn():
+
+    model = load_model(
+        CNN_MODEL_PATH,
+        compile=False,
+        custom_objects={
+            "ChannelAveragePool": ChannelAveragePool,
+            "ChannelMaxPool": ChannelMaxPool
+        }
+    )
+
+    return model
+
+
+# ============================================================================
+# PHASE
+# ============================================================================
+
+def get_phase(maturity):
+
+    maturity = float(maturity)
+
+    if maturity < 70:
+        return "Fase Vegetatif"
+
+    elif maturity < 90:
+        return "Fase Pembentukan Tajuk"
+
+    return "Fase Siap Panen"
+
+
+# ============================================================================
+# DASHBOARD DATA
+# ============================================================================
+
+def get_dashboard_row(index):
+
+    index = int(index)
+
+    row = df.iloc[index]
+
+    return row
+
+
+# ============================================================================
+# DASHBOARD PLOT
+# ============================================================================
+
+def dashboard_plot(index):
+
+    index = int(index)
+
+    history = df.iloc[:index + 1]
+
+    fig, axes = plt.subplots(
+        3,
+        1,
+        figsize=(12, 9)
+    )
+
+    # Soil moisture
+    axes[0].plot(
+        history["Replay_Index"],
+        history["Soil Moisture (%)"]
+    )
+
+    axes[0].set_title(
+        "Soil Moisture (%)"
+    )
+
+    axes[0].set_ylabel("%")
+    axes[0].grid(True, alpha=0.3)
+
+    # Temperature
+    axes[1].plot(
+        history["Replay_Index"],
+        history["Temperature (°C)"]
+    )
+
+    axes[1].set_title(
+        "Temperature (°C)"
+    )
+
+    axes[1].set_ylabel("°C")
+    axes[1].grid(True, alpha=0.3)
+
+    # Maturity
+    axes[2].plot(
+        history["Replay_Index"],
+        history[
+            "Ground Truth Maturity Level (%)"
+        ]
+    )
+
+    axes[2].set_title(
+        "Ground Truth Maturity Level (%)"
+    )
+
+    axes[2].set_xlabel(
+        "Replay Index"
+    )
+
+    axes[2].set_ylabel("%")
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    return fig
+
+
+# ============================================================================
+# LSTM PREDICTION
+# ============================================================================
+
+def predict_lstm(dap_start):
+
+    dap_start = int(dap_start)
+
+    # Ambil 21 observasi = 7 hari × 3 waktu
+    input_df = df[
+        df["DAP"].between(
+            dap_start,
+            dap_start + 6
+        )
+    ].copy()
+
+    input_df = input_df.sort_values(
+        ["DAP", "_Time_Order"]
+    )
+
+    if len(input_df) != 21:
+
+        raise ValueError(
+            "Data input LSTM harus memiliki "
+            "21 observasi."
+        )
+
+    features = [
+        "DAP",
+        "Soil Moisture (%)",
+        "Temperature (°C)"
+    ]
+
+    X = (
+        input_df[features]
+        .astype(np.float32)
+        .values
+    )
+
+    X = np.expand_dims(
+        X,
+        axis=0
+    )
+
+    model, scaler = load_lstm()
+
+    pred_scaled = model.predict(
+        X,
+        verbose=0
+    )
+
+    pred_scaled = np.asarray(
+        pred_scaled
+    ).reshape(-1, 1)
+
+    predictions = scaler.inverse_transform(
+        pred_scaled
+    ).flatten()
+
+    # Future 7 hari
+    future_daps = []
+
+    for day_offset in range(7):
+
+        future_dap = dap_start + 7 + day_offset
+
+        for waktu in [
+            "08:00",
+            "12:00",
+            "16:00"
+        ]:
+
+            future_daps.append(
+                (
+                    future_dap,
+                    waktu
+                )
+            )
+
+    # Model menghasilkan 21 output
+    result = pd.DataFrame({
+        "Horizon": [
+            f"H{i // 3 + 1}"
+            for i in range(21)
+        ],
+        "DAP": [
+            x[0]
+            for x in future_daps
+        ],
+        "Time": [
+            x[1]
+            for x in future_daps
+        ],
+        "Prediksi Maturity (%)": np.round(
+            predictions,
+            2
+        )
+    })
+
+    result["Fase"] = result[
+        "Prediksi Maturity (%)"
+    ].apply(get_phase)
+
+    return result
+
+
+# ============================================================================
+# CNN
+# ============================================================================
 
 CLASS_NAMES = [
     "Fase_Vegetatif",
@@ -63,934 +390,723 @@ CLASS_NAMES = [
 ]
 
 
-# ======================================================================
-# CNN CUSTOM LAYERS
-# ======================================================================
+def predict_cnn(uploaded_file):
 
-@tf.keras.utils.register_keras_serializable(
-    package="Pakcoy"
-)
-class ChannelAveragePool(tf.keras.layers.Layer):
+    image = Image.open(
+        uploaded_file
+    ).convert("RGB")
 
-    def call(self, inputs):
-
-        return tf.reduce_mean(
-            inputs,
-            axis=-1,
-            keepdims=True
-        )
-
-
-@tf.keras.utils.register_keras_serializable(
-    package="Pakcoy"
-)
-class ChannelMaxPool(tf.keras.layers.Layer):
-
-    def call(self, inputs):
-
-        return tf.reduce_max(
-            inputs,
-            axis=-1,
-            keepdims=True
-        )
-
-
-# ======================================================================
-# LOAD DATASET
-# ======================================================================
-
-df_dashboard = pd.read_excel(
-    DATASET_PATH
-)
-
-df_dashboard["_Time_Order"] = (
-    df_dashboard["Time"]
-    .astype(str)
-    .map({
-        "08:00": 1,
-        "12:00": 2,
-        "16:00": 3
-    })
-)
-
-df_dashboard = (
-    df_dashboard
-    .sort_values(
-        ["Day", "DAP", "_Time_Order"]
-    )
-    .reset_index(drop=True)
-)
-
-TOTAL_DATA = len(df_dashboard)
-
-DAP_MIN = int(
-    df_dashboard["DAP"].min()
-)
-
-DAP_MAX = int(
-    df_dashboard["DAP"].max()
-)
-
-
-# ======================================================================
-# LOAD LSTM
-# ======================================================================
-
-lstm_model = tf.keras.models.load_model(
-    LSTM_MODEL_PATH,
-    compile=False
-)
-
-lstm_scaler = joblib.load(
-    LSTM_SCALER_PATH
-)
-
-
-# ======================================================================
-# LOAD CNN
-# ======================================================================
-
-cnn_model = tf.keras.models.load_model(
-    CNN_MODEL_PATH,
-    compile=False,
-    safe_mode=True
-)
-
-
-# ======================================================================
-# DASHBOARD
-# ======================================================================
-
-WINDOW_SIZE = 30
-
-
-def dashboard_display(index):
-
-    index = int(index)
-
-    index = max(
-        0,
-        min(index, TOTAL_DATA - 1)
+    image_resized = image.resize(
+        (224, 224)
     )
 
-    row = df_dashboard.iloc[index]
+    array = np.asarray(
+        image_resized,
+        dtype=np.float32
+    ) / 255.0
 
-    day = row["Day"]
-    dap = row["DAP"]
-    waktu = row["Time"]
-
-    moisture = float(
-        row["Soil Moisture (%)"]
+    batch = np.expand_dims(
+        array,
+        axis=0
     )
 
-    temperature = float(
-        row["Temperature (°C)"]
+    model = load_cnn()
+
+    probabilities = model.predict(
+        batch,
+        verbose=0
+    )[0]
+
+    predicted_index = int(
+        np.argmax(probabilities)
     )
 
-    maturity = float(
-        row["Ground Truth Maturity Level (%)"]
-    )
-
-    if maturity < 70:
-        fase = "Fase Vegetatif"
-    elif maturity < 90:
-        fase = "Fase Pembentukan Tajuk"
-    else:
-        fase = "Fase Siap Panen"
-
-    start = max(
-        0,
-        index - WINDOW_SIZE + 1
-    )
-
-    data = df_dashboard.iloc[
-        start:index + 1
+    predicted_class = CLASS_NAMES[
+        predicted_index
     ]
 
-    x = np.arange(
-        start + 1,
-        index + 2
+    confidence = float(
+        probabilities[predicted_index]
     )
 
-    info = f"""
-## 🌱 MONITORING PAKCOY
+    result = pd.DataFrame({
+        "Kelas": CLASS_NAMES,
+        "Confidence (%)": np.round(
+            probabilities * 100,
+            2
+        )
+    })
 
-### Data {index + 1} / {TOTAL_DATA}
-
-| Parameter | Nilai |
-|---|---:|
-| **Day** | {day} |
-| **DAP / HST** | {dap} |
-| **Time** | {waktu} |
-| **Soil Moisture** | {moisture:.2f} % |
-| **Temperature** | {temperature:.2f} °C |
-| **Maturity** | {maturity:.2f} % |
-| **Fase** | **{fase}** |
-"""
-
-    fig = make_subplots(
-        rows=3,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.10,
-        subplot_titles=[
-            "Soil Moisture",
-            "Temperature",
-            "Ground Truth Maturity"
-        ]
+    return (
+        image,
+        predicted_class,
+        confidence,
+        result
     )
 
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=data["Soil Moisture (%)"],
-            mode="lines+markers"
+
+# ============================================================================
+# SIDEBAR
+# ============================================================================
+
+st.sidebar.title(
+    "🌱 Monitoring Pakcoy"
+)
+
+st.sidebar.markdown(
+    """
+    **Sistem Monitoring Pakcoy**
+
+    Dashboard berbasis dataset,
+    prediksi LSTM, klasifikasi CNN,
+    dan riwayat data.
+    """
+)
+
+st.sidebar.divider()
+
+st.sidebar.info(
+    f"Dataset: {len(df):,} data"
+)
+
+
+# ============================================================================
+# TITLE
+# ============================================================================
+
+st.title(
+    "🌱 SISTEM MONITORING PAKCOY"
+)
+
+st.caption(
+    "Monitoring Dashboard • LSTM Prediction • CNN Classification • Analytics / History"
+)
+
+
+# ============================================================================
+# TABS
+# ============================================================================
+
+tab_dashboard, tab_lstm, tab_cnn, tab_history = st.tabs(
+    [
+        "🌱 Dashboard",
+        "🧠 LSTM Prediction",
+        "📷 CNN Classification",
+        "📊 Analytics / History"
+    ]
+)
+
+
+# ============================================================================
+# 1. DASHBOARD
+# ============================================================================
+
+with tab_dashboard:
+
+    st.header(
+        "🌱 Dashboard Monitoring"
+    )
+
+    st.write(
+        "Replay dataset dari data pertama "
+        "sampai data terakhir."
+    )
+
+    # Session state
+    if "dashboard_index" not in st.session_state:
+
+        st.session_state.dashboard_index = 0
+
+    autoplay = st.checkbox(
+        "▶️ Autoplay",
+        value=True
+    )
+
+    interval_ms = st.slider(
+        "Kecepatan autoplay (ms)",
+        min_value=300,
+        max_value=3000,
+        value=1000,
+        step=100
+    )
+
+    if (
+        autoplay
+        and AUTOREFRESH_AVAILABLE
+    ):
+
+        st_autorefresh(
+            interval=interval_ms,
+            key="dashboard_refresh"
+        )
+
+        st.session_state.dashboard_index = (
+            st.session_state.dashboard_index + 1
+        ) % len(df)
+
+    elif autoplay and not AUTOREFRESH_AVAILABLE:
+
+        st.warning(
+            "Autoplay membutuhkan "
+            "streamlit-autorefresh."
+        )
+
+    index = st.slider(
+        "Replay Dataset",
+        min_value=0,
+        max_value=len(df) - 1,
+        value=int(
+            st.session_state.dashboard_index
         ),
-        row=1,
-        col=1
+        key="dashboard_slider"
     )
 
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=data["Temperature (°C)"],
-            mode="lines+markers"
-        ),
-        row=2,
-        col=1
-    )
+    if index != st.session_state.dashboard_index:
 
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=data[
-                "Ground Truth Maturity Level (%)"
-            ],
-            mode="lines+markers"
-        ),
-        row=3,
-        col=1
-    )
+        st.session_state.dashboard_index = index
 
-    fig.update_yaxes(
-        title_text="Moisture (%)",
-        row=1,
-        col=1
-    )
+    row = get_dashboard_row(index)
 
-    fig.update_yaxes(
-        title_text="Temperature (°C)",
-        row=2,
-        col=1
-    )
-
-    fig.update_yaxes(
-        title_text="Maturity (%)",
-        row=3,
-        col=1
-    )
-
-    fig.update_xaxes(
-        title_text="Urutan Data",
-        row=3,
-        col=1
-    )
-
-    fig.update_layout(
-        height=750,
-        margin=dict(
-            l=60,
-            r=30,
-            t=70,
-            b=50
-        ),
-        showlegend=False
-    )
-
-    return info, fig
-
-
-def dashboard_next(index):
-
-    index = int(index)
-
-    index += 1
-
-    if index >= TOTAL_DATA:
-        index = 0
-
-    return index
-
-
-# ======================================================================
-# LSTM
-# ======================================================================
-
-def lstm_prediction(dap_start):
-
-    try:
-
-        dap_start = int(
-            float(dap_start)
-        )
-
-        # Cari baris pertama dengan DAP tersebut
-        matching = df_dashboard[
-            df_dashboard["DAP"] == dap_start
-        ]
-
-        if len(matching) == 0:
-
-            return (
-                f"❌ DAP {dap_start} tidak tersedia.",
-                pd.DataFrame(),
-                None
-            )
-
-        start_index = matching.index[0]
-
-        # 21 observasi input
-        input_data = df_dashboard.loc[
-            start_index:start_index + 20,
-            [
-                "DAP",
-                "Soil Moisture (%)",
-                "Temperature (°C)"
-            ]
-        ].values.astype(
-            np.float32
-        )
-
-        if len(input_data) != 21:
-
-            return (
-                "❌ Data input 21 observasi tidak mencukupi.",
-                pd.DataFrame(),
-                None
-            )
-
-        X = np.expand_dims(
-            input_data,
-            axis=0
-        )
-
-        prediction_scaled = lstm_model.predict(
-            X,
-            verbose=0
-        )
-
-        prediction_scaled = np.asarray(
-            prediction_scaled
-        ).reshape(-1, 1)
-
-        prediction = lstm_scaler.inverse_transform(
-            prediction_scaled
-        ).reshape(-1)
-
-        # Future 21 observations
-        future = df_dashboard.iloc[
-            start_index + 21:
-            start_index + 42
-        ].copy()
-
-        n = min(
-            len(future),
-            len(prediction)
-        )
-
-        prediction = prediction[:n]
-        future = future.iloc[:n].copy()
-
-        result = pd.DataFrame({
-
-            "Horizon": [
-                f"H{i+1}"
-                for i in range(n)
-            ],
-
-            "DAP": future["DAP"].values,
-
-            "Time": future["Time"].values,
-
-            "Predicted Maturity (%)":
-                np.round(
-                    prediction,
-                    2
-                )
-        })
-
-        fig = go.Figure()
-
-        fig.add_trace(
-            go.Scatter(
-                x=result["DAP"],
-                y=result[
-                    "Predicted Maturity (%)"
-                ],
-                mode="lines+markers",
-                name="Predicted"
-            )
-        )
-
-        fig.update_layout(
-            title="Prediksi Maturity Pakcoy 7 Hari",
-            xaxis_title="DAP / HST",
-            yaxis_title="Maturity (%)",
-            height=450
-        )
-
-        summary = f"""
-## 🔮 HASIL PREDIKSI LSTM
-
-**Input DAP:** {dap_start}
-
-**Jumlah prediksi:** {n} observasi
-
-**Prediksi minimum:** {prediction.min():.2f} %
-
-**Prediksi maksimum:** {prediction.max():.2f} %
-"""
-
-        return (
-            summary,
-            result,
-            fig
-        )
-
-    except Exception as e:
-
-        return (
-            f"❌ Error LSTM: {str(e)}",
-            pd.DataFrame(),
-            None
-        )
-
-
-# ======================================================================
-# CNN
-# ======================================================================
-
-def cnn_prediction(image):
-
-    if image is None:
-
-        return (
-            "Silakan upload gambar Pakcoy.",
-            None,
-            None,
-            pd.DataFrame()
-        )
-
-    try:
-
-        if isinstance(image, np.ndarray):
-
-            img = Image.fromarray(
-                image.astype(np.uint8)
-            )
-
-        elif isinstance(image, Image.Image):
-
-            img = image
-
-        else:
-
-            img = Image.open(
-                image
-            )
-
-        img = img.convert("RGB")
-
-        display_image = img.copy()
-
-        img = img.resize(
-            IMG_SIZE
-        )
-
-        arr = np.asarray(
-            img,
-            dtype=np.float32
-        ) / 255.0
-
-        batch = np.expand_dims(
-            arr,
-            axis=0
-        )
-
-        probabilities = cnn_model.predict(
-            batch,
-            verbose=0
-        )[0]
-
-        predicted_index = int(
-            np.argmax(probabilities)
-        )
-
-        predicted_class = CLASS_NAMES[
-            predicted_index
-        ]
-
-        confidence = float(
-            probabilities[
-                predicted_index
-            ] * 100
-        )
-
-        table = pd.DataFrame({
-
-            "Kelas": CLASS_NAMES,
-
-            "Probability (%)": np.round(
-                probabilities * 100,
-                2
-            )
-        })
-
-        fig = go.Figure(
-            data=[
-                go.Bar(
-                    x=CLASS_NAMES,
-                    y=probabilities * 100
-                )
-            ]
-        )
-
-        fig.update_layout(
-            title="Probabilitas Klasifikasi CNN",
-            xaxis_title="Kelas",
-            yaxis_title="Probability (%)",
-            yaxis=dict(
-                range=[0, 100]
-            ),
-            height=400
-        )
-
-        summary = f"""
-## 🖼️ HASIL KLASIFIKASI CNN
-
-### Prediksi Utama
-
-# {predicted_class}
-
-### Confidence
-
-# {confidence:.2f} %
-
-Model menggunakan 3 kelas:
-
-- Fase Vegetatif
-- Fase Pembentukan Tajuk
-- Fase Siap Panen
-"""
-
-        return (
-            summary,
-            display_image,
-            fig,
-            table
-        )
-
-    except Exception as e:
-
-        return (
-            f"❌ Error CNN: {str(e)}",
-            None,
-            None,
-            pd.DataFrame()
-        )
-
-
-# ======================================================================
-# HISTORY
-# ======================================================================
-
-def history_process(dap_filter):
-
-    try:
-
-        if (
-            dap_filter is None
-            or str(dap_filter) == ""
-            or str(dap_filter) == "Semua Data"
-        ):
-
-            data = df_dashboard.copy()
-
-            filter_text = "Semua Data"
-
-        else:
-
-            dap_value = int(
-                float(dap_filter)
-            )
-
-            data = df_dashboard[
-                df_dashboard["DAP"] == dap_value
-            ].copy()
-
-            filter_text = f"DAP {dap_value}"
-
-        if len(data) == 0:
-
-            return (
-                "❌ Tidak ada data.",
-                None,
-                pd.DataFrame()
-            )
-
-        moisture_mean = data[
-            "Soil Moisture (%)"
-        ].mean()
-
-        temp_mean = data[
-            "Temperature (°C)"
-        ].mean()
-
-        maturity_mean = data[
+    phase = get_phase(
+        row[
             "Ground Truth Maturity Level (%)"
-        ].mean()
+        ]
+    )
 
-        if maturity_mean < 70:
-            fase = "Fase Vegetatif"
-        elif maturity_mean < 90:
-            fase = "Fase Pembentukan Tajuk"
-        else:
-            fase = "Fase Siap Panen"
+    # Metrics
+    c1, c2, c3, c4, c5 = st.columns(5)
 
-        summary = f"""
-## 📈 ANALYTICS / HISTORY MONITORING
+    c1.metric(
+        "Data",
+        f"{index + 1:,} / {len(df):,}"
+    )
 
-### Filter: **{filter_text}**
+    c2.metric(
+        "Day",
+        int(row["Day"])
+    )
 
-**Jumlah Data:** {len(data)}
+    c3.metric(
+        "DAP / HST",
+        int(row["DAP"])
+    )
 
-### Soil Moisture
-- Minimum: **{data["Soil Moisture (%)"].min():.2f} %**
-- Maximum: **{data["Soil Moisture (%)"].max():.2f} %**
-- Rata-rata: **{moisture_mean:.2f} %**
+    c4.metric(
+        "Soil Moisture",
+        f'{row["Soil Moisture (%)"]:.0f}%'
+    )
 
-### Temperature
-- Minimum: **{data["Temperature (°C)"].min():.2f} °C**
-- Maximum: **{data["Temperature (°C)"].max():.2f} °C**
-- Rata-rata: **{temp_mean:.2f} °C**
+    c5.metric(
+        "Temperature",
+        f'{row["Temperature (°C)"]:.1f}°C'
+    )
 
-### Maturity
-- Minimum: **{data["Ground Truth Maturity Level (%)"].min():.2f} %**
-- Maximum: **{data["Ground Truth Maturity Level (%)"].max():.2f} %**
-- Rata-rata: **{maturity_mean:.2f} %**
+    st.subheader(
+        "Informasi Data Saat Ini"
+    )
 
-### Fase
-**{fase}**
-"""
+    info_df = pd.DataFrame({
+        "Parameter": [
+            "Tanggal",
+            "Waktu",
+            "Soil Condition",
+            "Ground Truth Maturity",
+            "Fase",
+            "Ground Truth Criteria"
+        ],
+        "Nilai": [
+            str(
+                row["Timestamp"]
+            )[:10],
+            str(
+                row["Time"]
+            ),
+            row["Soil Condition"],
+            f'{row["Ground Truth Maturity Level (%)"]:.2f}%',
+            phase,
+            row["Ground Truth Criteria"]
+        ]
+    })
 
-        fig = go.Figure()
+    st.table(info_df)
 
-        fig.add_trace(
-            go.Scatter(
-                x=data["DAP"],
-                y=data[
-                    "Ground Truth Maturity Level (%)"
+    st.pyplot(
+        dashboard_plot(index),
+        use_container_width=True
+    )
+
+
+# ============================================================================
+# 2. LSTM
+# ============================================================================
+
+with tab_lstm:
+
+    st.header(
+        "🧠 Prediksi LSTM 7 Hari"
+    )
+
+    st.write(
+        "Gunakan 21 observasi terakhir "
+        "(7 hari × 3 waktu) untuk memprediksi "
+        "21 observasi berikutnya."
+    )
+
+    min_dap = int(
+        df["DAP"].min()
+    )
+
+    max_dap = int(
+        df["DAP"].max() - 6
+    )
+
+    dap_start = st.number_input(
+        "DAP Awal Input",
+        min_value=min_dap,
+        max_value=max_dap,
+        value=min_dap,
+        step=1
+    )
+
+    if st.button(
+        "🚀 Proses Prediksi LSTM",
+        type="primary"
+    ):
+
+        try:
+
+            with st.spinner(
+                "Memproses LSTM..."
+            ):
+
+                result = predict_lstm(
+                    dap_start
+                )
+
+            st.success(
+                "Prediksi LSTM berhasil."
+            )
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric(
+                "Jumlah Prediksi",
+                len(result)
+            )
+
+            c2.metric(
+                "Prediksi Minimum",
+                f'{result["Prediksi Maturity (%)"].min():.2f}%'
+            )
+
+            c3.metric(
+                "Prediksi Maksimum",
+                f'{result["Prediksi Maturity (%)"].max():.2f}%'
+            )
+
+            st.subheader(
+                "Tabel Prediksi 7 Hari"
+            )
+
+            st.dataframe(
+                result,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            fig, ax = plt.subplots(
+                figsize=(12, 5)
+            )
+
+            ax.plot(
+                range(1, len(result) + 1),
+                result[
+                    "Prediksi Maturity (%)"
                 ],
-                mode="lines+markers",
-                name="Maturity"
+                marker="o"
             )
+
+            ax.set_xlabel(
+                "Observasi Prediksi"
+            )
+
+            ax.set_ylabel(
+                "Maturity (%)"
+            )
+
+            ax.set_title(
+                "Prediksi Maturity LSTM - 7 Hari"
+            )
+
+            ax.grid(
+                True,
+                alpha=0.3
+            )
+
+            st.pyplot(
+                fig,
+                use_container_width=True
+            )
+
+        except Exception as e:
+
+            st.error(
+                f"Terjadi error LSTM: {e}"
+            )
+
+
+# ============================================================================
+# 3. CNN
+# ============================================================================
+
+with tab_cnn:
+
+    st.header(
+        "📷 CNN Classification"
+    )
+
+    st.write(
+        "Upload foto tanaman Pakcoy "
+        "untuk melakukan klasifikasi kondisi "
+        "pertumbuhan."
+    )
+
+    uploaded_file = st.file_uploader(
+        "📤 Upload foto Pakcoy",
+        type=[
+            "jpg",
+            "jpeg",
+            "png"
+        ]
+    )
+
+    if uploaded_file is not None:
+
+        try:
+
+            image, predicted_class, confidence, result = (
+                predict_cnn(
+                    uploaded_file
+                )
+            )
+
+            c1, c2 = st.columns(
+                [1, 1]
+            )
+
+            with c1:
+
+                st.image(
+                    image,
+                    caption="Foto Pakcoy",
+                    use_container_width=True
+                )
+
+            with c2:
+
+                st.subheader(
+                    "Hasil Klasifikasi"
+                )
+
+                st.success(
+                    predicted_class
+                )
+
+                st.metric(
+                    "Confidence",
+                    f"{confidence * 100:.2f}%"
+                )
+
+                st.dataframe(
+                    result,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            st.subheader(
+                "Grafik Confidence"
+            )
+
+            fig, ax = plt.subplots(
+                figsize=(10, 4)
+            )
+
+            ax.bar(
+                result["Kelas"],
+                result["Confidence (%)"]
+            )
+
+            ax.set_ylabel(
+                "Confidence (%)"
+            )
+
+            ax.set_xlabel(
+                "Kelas"
+            )
+
+            ax.set_ylim(
+                0,
+                100
+            )
+
+            ax.tick_params(
+                axis="x",
+                rotation=20
+            )
+
+            ax.grid(
+                axis="y",
+                alpha=0.3
+            )
+
+            st.pyplot(
+                fig,
+                use_container_width=True
+            )
+
+        except Exception as e:
+
+            st.error(
+                f"Terjadi error CNN: {e}"
+            )
+
+
+# ============================================================================
+# 4. ANALYTICS / HISTORY
+# ============================================================================
+
+with tab_history:
+
+    st.header(
+        "📊 Analytics / History"
+    )
+
+    st.write(
+        "Riwayat seluruh 1.140 data monitoring."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Total Data",
+        f"{len(df):,}"
+    )
+
+    c2.metric(
+        "DAP Minimum",
+        int(df["DAP"].min())
+    )
+
+    c3.metric(
+        "DAP Maksimum",
+        int(df["DAP"].max())
+    )
+
+    c4.metric(
+        "Jumlah Hari",
+        int(df["Day"].nunique())
+    )
+
+    st.subheader(
+        "Filter DAP"
+    )
+
+    dap_filter = st.slider(
+        "Pilih DAP",
+        min_value=int(
+            df["DAP"].min()
+        ),
+        max_value=int(
+            df["DAP"].max()
+        ),
+        value=int(
+            df["DAP"].min()
         )
+    )
 
-        fig.update_layout(
-            title="History Ground Truth Maturity",
-            xaxis_title="DAP / HST",
-            yaxis_title="Maturity (%)",
-            height=450
-        )
+    filtered = df[
+        df["DAP"] == dap_filter
+    ].copy()
 
-        return (
-            summary,
-            fig,
-            data
-        )
+    st.subheader(
+        f"History DAP {dap_filter}"
+    )
 
-    except Exception as e:
+    st.dataframe(
+        filtered.drop(
+            columns=["_Time_Order"],
+            errors="ignore"
+        ),
+        use_container_width=True,
+        hide_index=True
+    )
 
-        return (
-            f"❌ Error History: {str(e)}",
-            None,
-            pd.DataFrame()
-        )
+    st.subheader(
+        "Statistik Dataset"
+    )
 
+    stat_df = pd.DataFrame({
+        "Parameter": [
+            "Soil Moisture (%)",
+            "Temperature (°C)",
+            "Ground Truth Maturity (%)"
+        ],
+        "Minimum": [
+            df[
+                "Soil Moisture (%)"
+            ].min(),
+            df[
+                "Temperature (°C)"
+            ].min(),
+            df[
+                "Ground Truth Maturity Level (%)"
+            ].min()
+        ],
+        "Rata-rata": [
+            df[
+                "Soil Moisture (%)"
+            ].mean(),
+            df[
+                "Temperature (°C)"
+            ].mean(),
+            df[
+                "Ground Truth Maturity Level (%)"
+            ].mean()
+        ],
+        "Maksimum": [
+            df[
+                "Soil Moisture (%)"
+            ].max(),
+            df[
+                "Temperature (°C)"
+            ].max(),
+            df[
+                "Ground Truth Maturity Level (%)"
+            ].max()
+        ]
+    })
 
-# ======================================================================
-# FULL INTERFACE
-# ======================================================================
+    st.dataframe(
+        stat_df.round(2),
+        use_container_width=True,
+        hide_index=True
+    )
 
-with gr.Blocks(
-    title="Monitoring Pakcoy MILLI"
-) as demo:
+    st.subheader(
+        "Grafik History Maturity"
+    )
 
-    gr.Markdown(
-        """
-# 🌱 SISTEM MONITORING PAKCOY
+    fig, ax = plt.subplots(
+        figsize=(12, 5)
+    )
 
-### Monitoring Sensor • Prediksi LSTM • Klasifikasi CNN
-"""
+    ax.plot(
+        df["DAP"],
+        df[
+            "Ground Truth Maturity Level (%)"
+        ]
+    )
+
+    ax.set_xlabel(
+        "DAP / HST"
+    )
+
+    ax.set_ylabel(
+        "Maturity (%)"
+    )
+
+    ax.set_title(
+        "History Ground Truth Maturity"
+    )
+
+    ax.grid(
+        True,
+        alpha=0.3
+    )
+
+    st.pyplot(
+        fig,
+        use_container_width=True
+    )
+
+    st.subheader(
+        "History Soil Moisture"
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(12, 5)
+    )
+
+    ax.plot(
+        df["DAP"],
+        df["Soil Moisture (%)"]
+    )
+
+    ax.set_xlabel(
+        "DAP / HST"
+    )
+
+    ax.set_ylabel(
+        "Soil Moisture (%)"
+    )
+
+    ax.set_title(
+        "History Soil Moisture"
+    )
+
+    ax.grid(
+        True,
+        alpha=0.3
+    )
+
+    st.pyplot(
+        fig,
+        use_container_width=True
+    )
+
+    st.subheader(
+        "History Temperature"
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(12, 5)
+    )
+
+    ax.plot(
+        df["DAP"],
+        df["Temperature (°C)"]
+    )
+
+    ax.set_xlabel(
+        "DAP / HST"
+    )
+
+    ax.set_ylabel(
+        "Temperature (°C)"
+    )
+
+    ax.set_title(
+        "History Temperature"
+    )
+
+    ax.grid(
+        True,
+        alpha=0.3
+    )
+
+    st.pyplot(
+        fig,
+        use_container_width=True
     )
 
 
-    # ==================================================================
-    # DASHBOARD
-    # ==================================================================
+# ============================================================================
+# FOOTER
+# ============================================================================
 
-    with gr.Tab("📊 Dashboard"):
+st.divider()
 
-        dashboard_info = gr.Markdown()
-
-        dashboard_graph = gr.Plot(
-            label="Monitoring Pakcoy"
-        )
-
-        dashboard_index = gr.Slider(
-            minimum=0,
-            maximum=TOTAL_DATA - 1,
-            value=0,
-            step=1,
-            interactive=False,
-            label="Data Monitoring"
-        )
-
-        with gr.Row():
-
-            dashboard_start = gr.Button(
-                "▶ Start",
-                variant="primary"
-            )
-
-            dashboard_pause = gr.Button(
-                "⏸ Pause"
-            )
-
-            dashboard_reset = gr.Button(
-                "↩ Reset"
-            )
-
-        dashboard_timer = gr.Timer(
-            value=2.0,
-            active=True
-        )
-
-        demo.load(
-            dashboard_display,
-            inputs=dashboard_index,
-            outputs=[
-                dashboard_info,
-                dashboard_graph
-            ]
-        )
-
-        dashboard_timer.tick(
-            dashboard_next,
-            inputs=dashboard_index,
-            outputs=dashboard_index
-        )
-
-        dashboard_index.change(
-            dashboard_display,
-            inputs=dashboard_index,
-            outputs=[
-                dashboard_info,
-                dashboard_graph
-            ]
-        )
-
-        dashboard_start.click(
-            lambda: gr.Timer(
-                value=2.0,
-                active=True
-            ),
-            outputs=dashboard_timer
-        )
-
-        dashboard_pause.click(
-            lambda: gr.Timer(
-                value=2.0,
-                active=False
-            ),
-            outputs=dashboard_timer
-        )
-
-        dashboard_reset.click(
-            lambda: 0,
-            outputs=dashboard_index
-        )
-
-
-    # ==================================================================
-    # LSTM
-    # ==================================================================
-
-    with gr.Tab("🔮 LSTM Prediction"):
-
-        gr.Markdown(
-            """
-## 🔮 Prediksi Maturity Pakcoy 7 Hari
-"""
-        )
-
-        with gr.Row():
-
-            lstm_dap = gr.Number(
-                value=307,
-                label="DAP Awal Input",
-                precision=0
-            )
-
-            lstm_button = gr.Button(
-                "🔮 Proses Prediksi",
-                variant="primary"
-            )
-
-        lstm_summary = gr.Markdown()
-
-        lstm_table = gr.Dataframe(
-            label="Hasil Prediksi 7 Hari",
-            interactive=False
-        )
-
-        lstm_graph = gr.Plot(
-            label="Grafik Prediksi LSTM"
-        )
-
-        lstm_button.click(
-            lstm_prediction,
-            inputs=lstm_dap,
-            outputs=[
-                lstm_summary,
-                lstm_table,
-                lstm_graph
-            ]
-        )
-
-
-    # ==================================================================
-    # CNN
-    # ==================================================================
-
-    with gr.Tab("🖼️ CNN Classification"):
-
-        gr.Markdown(
-            """
-## 🖼️ Klasifikasi Fase Pakcoy
-
-Upload gambar tanaman Pakcoy.
-"""
-        )
-
-        cnn_image = gr.Image(
-            type="numpy",
-            label="Upload Gambar Pakcoy"
-        )
-
-        cnn_button = gr.Button(
-            "🔍 Klasifikasi Gambar",
-            variant="primary"
-        )
-
-        cnn_summary = gr.Markdown()
-
-        cnn_processed = gr.Image(
-            label="Gambar Diproses"
-        )
-
-        cnn_graph = gr.Plot(
-            label="Probabilitas Klasifikasi"
-        )
-
-        cnn_table = gr.Dataframe(
-            label="Probabilitas Setiap Kelas",
-            interactive=False
-        )
-
-        cnn_button.click(
-            cnn_prediction,
-            inputs=cnn_image,
-            outputs=[
-                cnn_summary,
-                cnn_processed,
-                cnn_graph,
-                cnn_table
-            ]
-        )
-
-
-    # ==================================================================
-    # HISTORY
-    # ==================================================================
-
-    with gr.Tab("📈 Analytics / History"):
-
-        gr.Markdown(
-            """
-## 📈 Analytics / History Monitoring
-"""
-        )
-
-        history_filter = gr.Dropdown(
-            choices=[
-                "Semua Data"
-            ] + list(
-                range(DAP_MIN, DAP_MAX + 1)
-            ),
-            value="Semua Data",
-            label="Filter DAP"
-        )
-
-        history_button = gr.Button(
-            "📊 Tampilkan Analytics",
-            variant="primary"
-        )
-
-        history_summary = gr.Markdown()
-
-        history_graph = gr.Plot(
-            label="History Monitoring"
-        )
-
-        history_table = gr.Dataframe(
-            label="History Data",
-            interactive=False
-        )
-
-        history_button.click(
-            history_process,
-            inputs=history_filter,
-            outputs=[
-                history_summary,
-                history_graph,
-                history_table
-            ]
-        )
-
-        demo.load(
-            lambda: history_process("Semua Data"),
-            inputs=None,
-            outputs=[
-                history_summary,
-                history_graph,
-                history_table
-            ]
-        )
-
-
-# ======================================================================
-# LAUNCH
-# ======================================================================
-
-if __name__ == "__main__":
-
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=int(
-            os.environ.get(
-                "PORT",
-                7860
-            )
-        )
-    )
+st.caption(
+    "Monitoring Pakcoy MILLI | "
+    "Dashboard + LSTM + CNN + Analytics / History"
+)
