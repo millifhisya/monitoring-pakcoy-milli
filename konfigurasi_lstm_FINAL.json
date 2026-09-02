@@ -1,0 +1,22 @@
+{
+    "project": "Monitoring Pakcoy MILLI",
+    "model_name": "Modified LSTM Seq2Seq 7 Days",
+    "model_file": "Modified_LSTM_Seq2Seq_7Days_FINAL.keras",
+    "scaler_file": "scaler_y_pakcoy_FINAL.pkl",
+    "input": {
+        "time_steps": 21,
+        "observations_per_day": 3,
+        "prediction_days": 7,
+        "features": [
+            "DAP",
+            "Soil Moisture (%)",
+            "Temperature (°C)"
+        ]
+    },
+    "target": "Ground Truth Maturity Level (%)",
+    "model_input_shape": "(None, 21, 3)",
+    "model_output_shape": "(None, 21, 1)",
+    "parameter_count": 50497,
+    "status": "FINAL_LOCKED",
+    "note": "Model ini adalah hasil training yang sudah diuji. Jangan melakukan retraining atau modifikasi arsitektur saat proses integrasi interface."
+}

@@ -1,0 +1,37 @@
+{
+    "model_name": "CNN_Modified_Spatial_Attention_Pakcoy_FINAL",
+    "input_shape": [
+        224,
+        224,
+        3
+    ],
+    "output_shape": [
+        3
+    ],
+    "parameters": 28038,
+    "classes": {
+        "0": "Fase_Vegetatif",
+        "1": "Fase_Pembentukan_Tajuk",
+        "2": "Fase_Siap_Panen"
+    },
+    "architecture": [
+        "Conv2D 16",
+        "MaxPooling2D",
+        "Conv2D 32",
+        "MaxPooling2D",
+        "Conv2D 64",
+        "MaxPooling2D",
+        "ChannelAveragePool",
+        "ChannelMaxPool",
+        "Concatenate",
+        "Conv2D Spatial Attention",
+        "Multiply",
+        "GlobalAveragePooling2D",
+        "Dense 64",
+        "Dropout 0.4",
+        "Dense 3 Softmax"
+    ],
+    "training_retrained": false,
+    "source_model": "cnn_modified",
+    "serialization_fix": "Lambda replaced with serializable custom layers"
+}
