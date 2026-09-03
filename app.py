@@ -142,11 +142,14 @@ df = load_dataset()
 
 
 # ============================================================================
-# LOAD LSTM
+# LOAD LSTM - LAZY LOADING
 # ============================================================================
 
 @st.cache_resource
 def load_lstm():
+
+    import tensorflow as tf
+    from tensorflow.keras.models import load_model
 
     model = load_model(
         LSTM_MODEL_PATH,
@@ -157,18 +160,44 @@ def load_lstm():
         LSTM_SCALER_PATH,
         "rb"
     ) as f:
-
         scaler = pickle.load(f)
 
     return model, scaler
 
 
 # ============================================================================
-# LOAD CNN
+# LOAD CNN - LAZY LOADING
 # ============================================================================
 
 @st.cache_resource
 def load_cnn():
+
+    import tensorflow as tf
+    from tensorflow.keras.models import load_model
+
+    @tf.keras.utils.register_keras_serializable(
+        package="Pakcoy"
+    )
+    class ChannelAveragePool(tf.keras.layers.Layer):
+
+        def call(self, inputs):
+            return tf.reduce_mean(
+                inputs,
+                axis=-1,
+                keepdims=True
+            )
+
+    @tf.keras.utils.register_keras_serializable(
+        package="Pakcoy"
+    )
+    class ChannelMaxPool(tf.keras.layers.Layer):
+
+        def call(self, inputs):
+            return tf.reduce_max(
+                inputs,
+                axis=-1,
+                keepdims=True
+            )
 
     model = load_model(
         CNN_MODEL_PATH,
@@ -185,7 +214,6 @@ def load_cnn():
 # ============================================================================
 # PHASE
 # ============================================================================
-
 def get_phase(maturity):
 
     maturity = float(maturity)
