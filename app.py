@@ -1,26 +1,40 @@
 import os
 
-# Paksa TensorFlow menggunakan CPU di Streamlit Cloud
+# ============================================================================
+# STREAMLIT CLOUD - MEMORY OPTIMIZATION
+# ============================================================================
+
+# Paksa TensorFlow menggunakan CPU
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+# Batasi thread CPU agar penggunaan resource lebih ringan
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
 
 import time
 import pickle
 import json
+import gc
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from PIL import Image
 
-import tensorflow as tf
-from tensorflow.keras.models import load_model
+
+# ============================================================================
+# AUTOREFRESH
+# ============================================================================
 
 try:
     from streamlit_autorefresh import st_autorefresh
     AUTOREFRESH_AVAILABLE = True
 except Exception:
     AUTOREFRESH_AVAILABLE = False
+
 
 # ============================================================================
 # PAGE CONFIG
@@ -35,29 +49,17 @@ st.set_page_config(
 
 
 # ============================================================================
-# CUSTOM CNN LAYERS
+# CATATAN TENSORFLOW
 # ============================================================================
-
-@tf.keras.utils.register_keras_serializable(package="Pakcoy")
-class ChannelAveragePool(tf.keras.layers.Layer):
-
-    def call(self, inputs):
-        return tf.reduce_mean(
-            inputs,
-            axis=-1,
-            keepdims=True
-        )
-
-
-@tf.keras.utils.register_keras_serializable(package="Pakcoy")
-class ChannelMaxPool(tf.keras.layers.Layer):
-
-    def call(self, inputs):
-        return tf.reduce_max(
-            inputs,
-            axis=-1,
-            keepdims=True
-        )
+#
+# TensorFlow SENGAJA TIDAK di-import di sini.
+#
+# TensorFlow akan dimuat hanya ketika fungsi LSTM/CNN dipanggil.
+# Tujuannya agar Dashboard tidak langsung memakan RAM besar.
+#
+# Custom CNN Layer juga akan dibuat saat CNN benar-benar digunakan.
+#
+# ============================================================================
 
 
 # ============================================================================
