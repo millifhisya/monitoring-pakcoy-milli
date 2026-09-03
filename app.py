@@ -13,6 +13,9 @@ import streamlit as st
 import matplotlib.pyplot as plt
 from PIL import Image
 
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+
 try:
     from streamlit_autorefresh import st_autorefresh
     AUTOREFRESH_AVAILABLE = True
