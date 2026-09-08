@@ -1,8 +1,8 @@
-streamlit==1.45.1
-tensorflow-cpu==2.18.1
-pandas==2.2.3
-numpy==2.0.2
-openpyxl==3.1.5
-Pillow==11.3.0
-scikit-learn==1.6.1
-matplotlib==3.10.3
+gradio
+numpy
+pandas
+matplotlib
+openpyxl
+pillow
+scikit-learn
+tensorflow-cpu
