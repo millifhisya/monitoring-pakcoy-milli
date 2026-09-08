@@ -2,6 +2,7 @@ services:
   - type: web
     name: monitoring-pakcoy-milli
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
     envVars:
